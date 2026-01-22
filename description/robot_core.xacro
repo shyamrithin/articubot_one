@@ -45,7 +45,15 @@
 
     </link>
 
+    <!-- BASE_FOOTPRINT LINK -->
 
+    <joint name="base_footprint_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="base_footprint"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+    </joint>
+
+  
     <!-- CHASSIS LINK -->
 
     <joint name="chassis_joint" type="fixed">
@@ -53,6 +61,10 @@
         <child link="chassis"/>
         <origin xyz="${-wheel_offset_x} 0 ${-wheel_offset_z}"/>
     </joint>
+
+    <link name="base_footprint">
+    </link>
+    
 
     <link name="chassis">
         <visual>
