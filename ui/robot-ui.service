@@ -1,0 +1,42 @@
+# =============================================================================
+# File:        ui/robot-ui.service
+# Package:     articubot_one
+# =============================================================================
+# DESCRIPTION
+# -----------
+# systemd unit that starts the robot UI supervisor at boot. It only starts
+# the web page and rosbridge; the robot stack itself starts when a mode is
+# chosen on the page.
+#
+# Install:
+#   sudo cp ~/robot_ws/src/articubot_one/ui/robot-ui.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now robot-ui
+#
+# Logs:     journalctl -u robot-ui -f
+# Restart:  sudo systemctl restart robot-ui
+#
+# KillMode=mixed sends SIGTERM to the supervisor only, giving it time to stop
+# each ros2 launch cleanly; anything still left after TimeoutStopSec is killed.
+# =============================================================================
+
+[Unit]
+Description=Robot UI supervisor (web page, rosbridge, mode control)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shyam
+WorkingDirectory=/home/shyam
+Environment=ROS_DOMAIN_ID=42
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=ROS_LOCALHOST_ONLY=0
+ExecStart=/home/shyam/robot_ws/src/articubot_one/ui/start_ui.sh
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

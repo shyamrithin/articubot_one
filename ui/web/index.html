@@ -1,0 +1,816 @@
+<!doctype html>
+<!--
+=============================================================================
+File:        ui/web/index.html
+Package:     articubot_one
+Served by:   ui/robot_supervisor.py on http://<robot>:8080
+=============================================================================
+DESCRIPTION
+-----------
+Control page for the robot. The same page runs full-screen on the robot's
+touchscreen (http://localhost:8080) and in a phone browser
+(http://shyam-rpi4.local:8080, or the IP shown in the top bar).
+
+Talks to ROS through rosbridge on port 9090 with a tiny built-in client
+(no external libraries, so it works with no internet on the hotspot).
+
+  Top bar      connection, robot address, CPU temperature, power, lidar rate
+  Map          live map, laser scan, planned path, robot, goal
+                 Set goal      tap a spot; drag to choose final heading
+                 Set position  same gesture, tells AMCL where the robot is
+                 Drive         shows a thumb pad, publishes /cmd_vel_web
+  Side panel   Map / Explore / Navigate modes, saved-map picker, progress,
+               Save map, Robot is at map start, Cancel goal, Stop all,
+               recent events, and the Stop robot button (twist_mux priority 255)
+
+Sends JSON commands on /ui/command; reads /ui/status, /ui/live, /ui/map,
+/ui/plan. See robot_supervisor.py for the message formats.
+=============================================================================
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#13222E">
+<title>Rover control</title>
+<style>
+  :root {
+    --bg: #E4E9EC;
+    --panel: #F6F8F9;
+    --ink: #13222E;
+    --muted: #56666F;
+    --line: #C6D0D6;
+    --hivis: #F26B1D;
+    --stop: #C3201C;
+    --ok: #17855A;
+    --warn: #9A6408;
+    --route: #2356C4;
+    --unknown: #D3DAE0;
+    font-family: "Ubuntu", "Ubuntu Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 15px;
+    color: var(--ink);
+    background: var(--bg);
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    -webkit-tap-highlight-color: transparent;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  button {
+    font: inherit;
+    color: inherit;
+    min-height: 44px;
+    padding: 0 14px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: #fff;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:disabled { opacity: .42; cursor: default; }
+  button:focus-visible, select:focus-visible { outline: 3px solid var(--route); outline-offset: 2px; }
+
+  /* Top bar ---------------------------------------------------------------- */
+  .bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    min-height: 40px;
+    padding: 6px 14px;
+    background: var(--ink);
+    color: #E9EFF2;
+    font-size: 14px;
+  }
+  .who { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .who strong { font-weight: 500; white-space: nowrap; }
+  .who span { color: #A9B8C2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .link { width: 10px; height: 10px; border-radius: 50%; background: var(--stop); flex: none; }
+  .link.up { background: #3FCB8B; }
+  .vitals {
+    display: flex;
+    gap: 16px;
+    font-family: "Ubuntu Condensed", "Ubuntu", system-ui, sans-serif;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .vitals .warn { color: #FFB547; }
+
+  /* Layout ----------------------------------------------------------------- */
+  .layout {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 272px;
+    gap: 10px;
+    padding: 10px;
+  }
+
+  /* Map -------------------------------------------------------------------- */
+  .mapwrap {
+    position: relative;
+    min-height: 0;
+    overflow: hidden;
+    border-radius: 12px;
+    background: var(--unknown);
+  }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; }
+  .tools { position: absolute; top: 8px; left: 8px; z-index: 2; display: flex; gap: 6px; flex-wrap: wrap; }
+  .tools button { background: rgba(246, 248, 249, .95); }
+  .tools button[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: #fff; }
+  .empty {
+    position: absolute;
+    inset: 0;
+    margin: 0;
+    display: grid;
+    place-items: center;
+    padding: 64px 28px 28px;
+    text-align: center;
+    line-height: 1.45;
+    color: var(--muted);
+  }
+  .hint {
+    position: absolute;
+    left: 8px;
+    bottom: 8px;
+    z-index: 2;
+    max-width: min(60%, 420px);
+    margin: 0;
+    padding: 6px 10px;
+    border-radius: 8px;
+    background: rgba(19, 34, 46, .8);
+    color: #fff;
+    font-size: 13px;
+    line-height: 1.35;
+  }
+  .pad {
+    position: absolute;
+    right: 16px;
+    bottom: 16px;
+    z-index: 2;
+    width: 150px;
+    height: 150px;
+    border-radius: 50%;
+    background: rgba(19, 34, 46, .12);
+    border: 2px solid rgba(19, 34, 46, .35);
+    touch-action: none;
+  }
+  .knob {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 58px;
+    height: 58px;
+    margin: -29px 0 0 -29px;
+    border-radius: 50%;
+    background: var(--hivis);
+    border: 3px solid #fff;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, .25);
+    pointer-events: none;
+  }
+
+  /* Side panel ------------------------------------------------------------- */
+  .side { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+  .side > * { flex-shrink: 0; }   /* only the event log may shrink */
+  .modes {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    border: 1px solid var(--ink);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .modes button { border: 0; border-radius: 0; background: var(--panel); font-weight: 500; }
+  .modes button + button { border-left: 1px solid var(--ink); }
+  .modes button[aria-pressed="true"] { background: var(--ink); color: #fff; }
+  .mapsel { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 14px; }
+  .mapsel select {
+    flex: 1;
+    min-width: 0;
+    min-height: 40px;
+    padding: 0 8px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: #fff;
+    color: var(--ink);
+    font: inherit;
+  }
+  .phase { margin: 0; min-height: 2.8em; line-height: 1.4; padding-left: 10px; border-left: 4px solid var(--line); }
+  .phase.busy { border-left-color: var(--hivis); }
+  .facts { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; font-size: 14px; }
+  .facts dt { color: var(--muted); }
+  .facts dd { margin: 0; font-weight: 500; font-variant-numeric: tabular-nums; }
+  .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .actions button { font-size: 14px; padding: 0 8px; line-height: 1.15; }
+  .log {
+    flex: 1 1 0;
+    min-height: 0;
+    margin: 0;
+    padding: 6px 0 0;
+    overflow: auto;
+    list-style: none;
+    border-top: 1px solid var(--line);
+    font-size: 12.5px;
+    line-height: 1.35;
+    color: var(--muted);
+  }
+  .log li { padding: 2px 0; }
+  .log time { margin-right: 6px; font-variant-numeric: tabular-nums; }
+  .log .warn { color: var(--warn); }
+  .log .error { color: var(--stop); }
+
+  /* The one loud thing on the screen. Engaged = hazard-striped border. */
+  .estop {
+    flex: none;
+    min-height: 66px;
+    border: 6px solid var(--stop);
+    border-radius: 14px;
+    background: var(--stop);
+    color: #fff;
+    font-size: 20px;
+    font-weight: 700;
+  }
+  .estop[aria-pressed="true"] {
+    border-color: transparent;
+    background:
+      linear-gradient(var(--ink), var(--ink)) padding-box,
+      repeating-linear-gradient(135deg, #F2C200 0 10px, var(--ink) 10px 20px) border-box;
+  }
+
+  .banner, .toast {
+    position: fixed;
+    left: 50%;
+    top: 50px;
+    z-index: 10;
+    max-width: 92vw;
+    transform: translateX(-50%);
+    padding: 10px 16px;
+    border-radius: 10px;
+    font-size: 14px;
+    line-height: 1.4;
+  }
+  .banner { background: var(--stop); color: #fff; }
+  .toast { background: var(--ink); color: #fff; top: auto; bottom: 90px; }
+
+  /* Phone, portrait: map on top, controls underneath, Stop pinned. -------- */
+  @media (max-aspect-ratio: 1/1) {
+    html, body { height: auto; min-height: 100%; }
+    body { overflow: auto; }
+    .bar { flex-wrap: wrap; row-gap: 2px; }
+    .vitals { gap: 12px; }
+    .layout { flex: none; grid-template-columns: 1fr; grid-template-rows: 46vh auto; }
+    .log { flex: none; max-height: 150px; }
+    .estop { position: sticky; bottom: 8px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+    button:active:not(:disabled) { transform: none; }
+  }
+</style>
+</head>
+<body>
+  <header class="bar">
+    <div class="who">
+      <span class="link" id="link" aria-label="Connection"></span>
+      <strong id="host">Robot</strong>
+      <span id="addr">Connecting…</span>
+    </div>
+    <div class="vitals">
+      <span id="temp"></span>
+      <span id="power"></span>
+      <span id="lidar"></span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="mapwrap" aria-label="Map">
+      <div class="tools" role="toolbar" aria-label="Map tools">
+        <button data-tool="goal" aria-pressed="true">Set goal</button>
+        <button data-tool="pose" aria-pressed="false">Set position</button>
+        <button data-tool="drive" aria-pressed="false">Drive</button>
+      </div>
+      <canvas id="map"></canvas>
+      <p class="empty" id="empty">No map yet. Start Map or Explore to build one, or Navigate to load a saved map.</p>
+      <div class="pad" id="pad" hidden><div class="knob" id="knob"></div></div>
+      <p class="hint" id="hint"></p>
+    </section>
+
+    <aside class="side">
+      <div class="modes" role="group" aria-label="Mode">
+        <button data-mode="map" aria-pressed="false">Map</button>
+        <button data-mode="explore" aria-pressed="false">Explore</button>
+        <button data-mode="navigate" aria-pressed="false">Navigate</button>
+      </div>
+      <label class="mapsel">Saved map <select id="mapname"></select></label>
+      <p class="phase" id="phase">Connecting to the robot…</p>
+      <dl class="facts">
+        <dt>Position</dt><dd id="pos">Unknown</dd>
+        <dt>Goal</dt><dd id="goal">None</dd>
+      </dl>
+      <div class="actions">
+        <button id="save" disabled>Save map</button>
+        <button id="atstart" disabled>Robot is at map start</button>
+        <button id="cancel" disabled>Cancel goal</button>
+        <button id="stopall" disabled>Stop all</button>
+      </div>
+      <ol class="log" id="log" aria-label="Recent events"></ol>
+      <button class="estop" id="estop" aria-pressed="false">Stop robot</button>
+    </aside>
+  </main>
+
+  <div class="banner" id="banner" role="alert" hidden></div>
+  <div class="toast" id="toast" role="status" hidden></div>
+
+<script>
+'use strict';
+
+const HOST = location.hostname || 'localhost';
+const BRIDGE_URL = `ws://${HOST}:9090`;
+const MAX_LINEAR = 0.25;   // m/s, just under Nav2's max_vel_x of 0.26
+const MAX_ANGULAR = 1.0;   // rad/s
+const COLOR = {
+  free: [251, 252, 253],
+  occupied: [19, 34, 46],
+  unknown: [211, 218, 224],
+  route: '#2356C4',
+  scan: '#C3201C',
+  robot: '#F26B1D',
+  ink: '#13222E',
+  goal: '#17855A',
+};
+const HINTS = {
+  goal: 'Tap where the robot should go. Drag to choose which way it ends up facing.',
+  pose: 'Tap where the robot is now, and drag the way it is facing.',
+  drive: 'Hold the pad and push to drive. Let go to stop.',
+};
+
+// --- Minimal rosbridge client ---------------------------------------------
+class Bridge {
+  constructor(url) {
+    this.url = url;
+    this.subs = new Map();
+    this.adverts = new Map();
+    this.open = false;
+    this.onstate = () => {};
+    this.connect();
+  }
+  connect() {
+    let ws;
+    try { ws = new WebSocket(this.url); } catch (e) { setTimeout(() => this.connect(), 2000); return; }
+    this.ws = ws;
+    ws.onopen = () => {
+      this.open = true;
+      for (const [topic, type] of this.adverts) this.raw({ op: 'advertise', topic, type });
+      for (const [topic, s] of this.subs) this.raw({ op: 'subscribe', topic, type: s.type, queue_length: 1 });
+      this.onstate(true);
+    };
+    ws.onmessage = (ev) => {
+      let m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.op === 'publish') {
+        const s = this.subs.get(m.topic);
+        if (s) s.cb(m.msg);
+      }
+    };
+    ws.onclose = () => {
+      this.open = false;
+      this.onstate(false);
+      setTimeout(() => this.connect(), 1500);
+    };
+    ws.onerror = () => ws.close();
+  }
+  raw(obj) { if (this.open && this.ws.readyState === 1) this.ws.send(JSON.stringify(obj)); }
+  subscribe(topic, type, cb) { this.subs.set(topic, { type, cb }); this.raw({ op: 'subscribe', topic, type, queue_length: 1 }); }
+  advertise(topic, type) { this.adverts.set(topic, type); this.raw({ op: 'advertise', topic, type }); }
+  publish(topic, msg) { this.raw({ op: 'publish', topic, msg }); }
+}
+
+// --- State ------------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+const canvas = $('map');
+const ctx = canvas.getContext('2d');
+let dpr = 1, cssW = 0, cssH = 0;
+let map = null;          // decoded map + offscreen image
+let view = null;         // {s, x0, y0}: map-cell -> CSS pixel transform
+let live = { pose: null, scan: [], goal: null };
+let plan = [];
+let status = null;
+let tool = 'goal';
+let drag = null;
+let framePending = false;
+let toastTimer = null;
+
+const bridge = new Bridge(BRIDGE_URL);
+bridge.onstate = (up) => {
+  $('link').classList.toggle('up', up);
+  $('banner').hidden = up;
+  if (!up) {
+    $('banner').textContent = `Can't reach the robot at ${HOST}:9090. Check it is powered on and the robot-ui service is running.`;
+    $('addr').textContent = 'Not connected';
+  }
+};
+bridge.advertise('/ui/command', 'std_msgs/msg/String');
+bridge.advertise('/cmd_vel_web', 'geometry_msgs/msg/Twist');
+bridge.subscribe('/ui/status', 'std_msgs/msg/String', (m) => { status = JSON.parse(m.data); renderStatus(); });
+bridge.subscribe('/ui/live', 'std_msgs/msg/String', (m) => { live = JSON.parse(m.data); requestRender(); });
+bridge.subscribe('/ui/plan', 'std_msgs/msg/String', (m) => { plan = JSON.parse(m.data).points || []; requestRender(); });
+bridge.subscribe('/ui/map', 'std_msgs/msg/String', (m) => {
+  const payload = JSON.parse(m.data);
+  if (map && payload.stamp === map.stamp) return;  // periodic resend of the same map
+  map = decodeMap(payload);
+  fit();
+  requestRender();
+});
+
+const send = (cmd) => bridge.publish('/ui/command', { data: JSON.stringify(cmd) });
+
+function toast(text) {
+  const el = $('toast');
+  el.textContent = text;
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.hidden = true; }, 4000);
+}
+
+// --- Map drawing ------------------------------------------------------------
+function decodeMap(p) {
+  const bytes = atob(p.data);
+  const off = document.createElement('canvas');
+  off.width = p.w;
+  off.height = p.h;
+  const octx = off.getContext('2d');
+  const img = octx.createImageData(p.w, p.h);
+  for (let row = 0; row < p.h; row++) {
+    for (let col = 0; col < p.w; col++) {
+      const v = bytes.charCodeAt(row * p.w + col);
+      const i = ((p.h - 1 - row) * p.w + col) * 4;   // grid row 0 is the bottom
+      let c;
+      if (v === 255) {
+        c = COLOR.unknown;
+      } else {
+        const t = Math.min(v, 100) / 100;
+        c = [0, 1, 2].map((k) => Math.round(COLOR.free[k] + (COLOR.occupied[k] - COLOR.free[k]) * t));
+      }
+      img.data[i] = c[0];
+      img.data[i + 1] = c[1];
+      img.data[i + 2] = c[2];
+      img.data[i + 3] = 255;
+    }
+  }
+  octx.putImageData(img, 0, 0);
+  return { ...p, img: off };
+}
+
+function fit() {
+  if (!map || !cssW || !cssH) return;
+  const pad = 16;
+  const top = 56;  // keep the tool buttons off the map
+  const s = Math.min((cssW - 2 * pad) / map.w, (cssH - top - pad) / map.h);
+  view = { s, x0: (cssW - map.w * s) / 2, y0: top + (cssH - top - pad - map.h * s) / 2 };
+}
+
+function toScreen(x, y) {
+  const cx = (x - map.ox) / map.res;
+  const cy = (y - map.oy) / map.res;
+  return [view.x0 + cx * view.s, view.y0 + (map.h - cy) * view.s];
+}
+
+function toWorld(px, py) {
+  const cx = (px - view.x0) / view.s;
+  const cy = map.h - (py - view.y0) / view.s;
+  return [map.ox + cx * map.res, map.oy + cy * map.res];
+}
+
+function roundedRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawRobot(x, y, yaw) {
+  const [sx, sy] = toScreen(x, y);
+  const size = Math.max(18, (0.32 / map.res) * view.s);
+  ctx.save();
+  ctx.translate(sx, sy);
+  ctx.rotate(-yaw);   // screen y points down
+  roundedRect(-size / 2, -size / 2, size, size, size * 0.18);
+  ctx.fillStyle = COLOR.robot;
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = COLOR.ink;
+  ctx.stroke();
+  // Long, narrow arrow so the heading can't be misread at any angle.
+  ctx.beginPath();
+  ctx.moveTo(size * 0.44, 0);
+  ctx.lineTo(-size * 0.24, -size * 0.17);
+  ctx.lineTo(-size * 0.10, 0);
+  ctx.lineTo(-size * 0.24, size * 0.17);
+  ctx.closePath();
+  ctx.fillStyle = '#fff';
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawGoal(x, y, yaw) {
+  const [sx, sy] = toScreen(x, y);
+  ctx.save();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = COLOR.goal;
+  ctx.fillStyle = 'rgba(23, 133, 90, .18)';
+  ctx.beginPath();
+  ctx.arc(sx, sy, 11, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(sx, sy);
+  ctx.lineTo(sx + Math.cos(-yaw) * 22, sy + Math.sin(-yaw) * 22);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawDrag(d, color) {
+  ctx.save();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(d.x0, d.y0, 8, 0, Math.PI * 2);
+  ctx.fill();
+  const len = Math.hypot(d.x1 - d.x0, d.y1 - d.y0);
+  if (len > 14) {
+    const a = Math.atan2(d.y1 - d.y0, d.x1 - d.x0);
+    ctx.beginPath();
+    ctx.moveTo(d.x0, d.y0);
+    ctx.lineTo(d.x1, d.y1);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(d.x1, d.y1);
+    ctx.lineTo(d.x1 - 14 * Math.cos(a - 0.45), d.y1 - 14 * Math.sin(a - 0.45));
+    ctx.lineTo(d.x1 - 14 * Math.cos(a + 0.45), d.y1 - 14 * Math.sin(a + 0.45));
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function requestRender() {
+  if (!framePending) {
+    framePending = true;
+    requestAnimationFrame(render);
+  }
+}
+
+function render() {
+  framePending = false;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+  $('empty').hidden = !!map;
+  if (!map || !view) return;
+
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(map.img, view.x0, view.y0, map.w * view.s, map.h * view.s);
+
+  if (plan.length > 1) {
+    ctx.save();
+    ctx.lineWidth = 4;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = COLOR.route;
+    ctx.beginPath();
+    plan.forEach(([x, y], i) => {
+      const [sx, sy] = toScreen(x, y);
+      if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+    });
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  if (live.scan && live.scan.length) {
+    ctx.fillStyle = COLOR.scan;
+    for (const [x, y] of live.scan) {
+      const [sx, sy] = toScreen(x, y);
+      ctx.fillRect(sx - 1.5, sy - 1.5, 3, 3);
+    }
+  }
+
+  if (live.goal) drawGoal(...live.goal);
+  if (live.pose) drawRobot(...live.pose);
+  if (drag) drawDrag(drag, tool === 'pose' ? COLOR.robot : COLOR.goal);
+}
+
+function resize() {
+  const r = canvas.getBoundingClientRect();
+  dpr = window.devicePixelRatio || 1;
+  cssW = r.width;
+  cssH = r.height;
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  fit();
+  requestRender();
+}
+new ResizeObserver(resize).observe(canvas);
+
+// --- Tools: set goal / set position ------------------------------------------
+function setTool(next) {
+  if (tool === 'drive' && next !== 'drive') padRelease();
+  tool = next;
+  for (const b of document.querySelectorAll('[data-tool]')) {
+    b.setAttribute('aria-pressed', String(b.dataset.tool === next));
+  }
+  $('pad').hidden = next !== 'drive';
+  $('hint').textContent = HINTS[next];
+}
+document.querySelectorAll('[data-tool]').forEach((b) => b.addEventListener('click', () => setTool(b.dataset.tool)));
+
+function localPoint(e) {
+  const r = canvas.getBoundingClientRect();
+  return [e.clientX - r.left, e.clientY - r.top];
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (tool === 'drive' || !map || !view) return;
+  canvas.setPointerCapture(e.pointerId);
+  const [x, y] = localPoint(e);
+  drag = { x0: x, y0: y, x1: x, y1: y };
+  requestRender();
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (!drag) return;
+  [drag.x1, drag.y1] = localPoint(e);
+  requestRender();
+});
+canvas.addEventListener('pointerup', () => {
+  if (!drag) return;
+  const d = drag;
+  drag = null;
+  const [x, y] = toWorld(d.x0, d.y0);
+  let yaw;
+  if (Math.hypot(d.x1 - d.x0, d.y1 - d.y0) > 14) {
+    yaw = Math.atan2(-(d.y1 - d.y0), d.x1 - d.x0);
+  } else if (tool === 'goal' && live.pose) {
+    yaw = Math.atan2(y - live.pose[1], x - live.pose[0]);  // face the way it travelled
+  } else {
+    yaw = live.pose ? live.pose[2] : 0;
+  }
+  if (tool === 'goal') {
+    send({ cmd: 'goal', x, y, yaw });
+  } else {
+    send({ cmd: 'initial_pose', x, y, yaw });
+    setTool('goal');
+  }
+  requestRender();
+});
+canvas.addEventListener('pointercancel', () => { drag = null; requestRender(); });
+
+// --- Drive pad ---------------------------------------------------------------
+const pad = $('pad');
+const knob = $('knob');
+let padActive = false;
+let padCmd = { v: 0, w: 0 };
+let padTimer = null;
+const twist = (v, w) => ({ linear: { x: v, y: 0, z: 0 }, angular: { x: 0, y: 0, z: w } });
+
+function padMove(e) {
+  const r = pad.getBoundingClientRect();
+  const R = r.width / 2;
+  let dx = (e.clientX - r.left - R) / R;
+  let dy = (e.clientY - r.top - R) / R;
+  const m = Math.hypot(dx, dy);
+  if (m > 1) { dx /= m; dy /= m; }
+  knob.style.transform = `translate(${dx * R * 0.7}px, ${dy * R * 0.7}px)`;
+  const dead = (v) => (Math.abs(v) < 0.12 ? 0 : v);
+  padCmd = { v: -dead(dy) * MAX_LINEAR, w: -dead(dx) * MAX_ANGULAR };
+}
+function padRelease() {
+  if (!padActive) return;
+  padActive = false;
+  padCmd = { v: 0, w: 0 };
+  knob.style.transform = '';
+  clearInterval(padTimer);
+  padTimer = null;
+  for (let i = 0; i < 3; i++) bridge.publish('/cmd_vel_web', twist(0, 0));
+}
+pad.addEventListener('pointerdown', (e) => {
+  pad.setPointerCapture(e.pointerId);
+  padActive = true;
+  padMove(e);
+  if (!padTimer) padTimer = setInterval(() => bridge.publish('/cmd_vel_web', twist(padCmd.v, padCmd.w)), 100);
+});
+pad.addEventListener('pointermove', (e) => { if (padActive) padMove(e); });
+for (const ev of ['pointerup', 'pointercancel', 'lostpointercapture']) pad.addEventListener(ev, padRelease);
+
+// --- Buttons -----------------------------------------------------------------
+const modeButtons = [...document.querySelectorAll('[data-mode]')];
+modeButtons.forEach((b) => b.addEventListener('click', () => {
+  const msg = { cmd: 'start', mode: b.dataset.mode };
+  if (msg.mode === 'navigate') {
+    const name = $('mapname').value;
+    if (!name) { toast('No saved maps yet. Use Map, drive around, then Save map.'); return; }
+    msg.map = name;
+  }
+  send(msg);
+}));
+$('stopall').addEventListener('click', () => send({ cmd: 'stop' }));
+$('save').addEventListener('click', () => send({ cmd: 'save_map' }));
+$('cancel').addEventListener('click', () => send({ cmd: 'cancel' }));
+$('atstart').addEventListener('click', () => send({ cmd: 'initial_pose', x: 0, y: 0, yaw: 0 }));
+$('estop').addEventListener('click', () => {
+  const engage = !(status && status.estop);
+  send({ cmd: 'estop', on: engage });
+  const b = $('estop');
+  b.setAttribute('aria-pressed', String(engage));  // instant feedback; status confirms
+  b.textContent = engage ? 'Release stop' : 'Stop robot';
+});
+
+// --- Status ------------------------------------------------------------------
+function powerText(raw) {
+  if (raw == null) return { text: '', warn: false };
+  const v = parseInt(raw, 16);
+  if (Number.isNaN(v)) return { text: '', warn: false };
+  if (v & 0x1) return { text: 'Low voltage now', warn: true };
+  if (v & 0x4) return { text: 'Throttled', warn: true };
+  if (v & 0x10000) return { text: 'Low voltage earlier', warn: true };
+  return { text: 'Power OK', warn: false };
+}
+
+function goalText(nav) {
+  switch (nav.state) {
+    case 'sending': return 'Sending…';
+    case 'driving': return nav.remaining != null ? `Driving, ${nav.remaining.toFixed(1)} m left` : 'Driving';
+    case 'arrived': return 'Arrived';
+    case 'cancelled': return 'Cancelled';
+    case 'failed': return 'Could not reach it';
+    case 'rejected': return 'Rejected';
+    default: return 'None';
+  }
+}
+
+function renderStatus() {
+  const s = status;
+  $('host').textContent = s.hostname;
+  $('addr').textContent = s.ip ? `${s.ip}:${s.http_port}` : 'No network address';
+  $('temp').textContent = s.temp_c != null ? `CPU ${Math.round(s.temp_c)} °C` : '';
+  $('temp').classList.toggle('warn', s.temp_c != null && s.temp_c >= 75);
+  const power = powerText(s.throttled);
+  $('power').textContent = power.text;
+  $('power').classList.toggle('warn', power.warn);
+  $('lidar').textContent = s.scan_hz > 0 ? `Lidar ${s.scan_hz.toFixed(1)} Hz` : 'Lidar off';
+
+  for (const b of modeButtons) {
+    b.setAttribute('aria-pressed', String(b.dataset.mode === s.mode));
+    b.disabled = s.busy;
+  }
+
+  const sel = $('mapname');
+  const names = s.maps || [];
+  const key = names.join('|');
+  if (sel.dataset.key !== key) {
+    const keep = sel.value || s.active_map || names[0] || '';
+    sel.replaceChildren(...(names.length ? names : ['']).map((n) => {
+      const o = document.createElement('option');
+      o.value = n;
+      o.textContent = n || 'No saved maps';
+      return o;
+    }));
+    sel.value = names.includes(keep) ? keep : (names[0] || '');
+    sel.dataset.key = key;
+  }
+
+  $('phase').textContent = s.phase;
+  $('phase').classList.toggle('busy', s.busy);
+  $('pos').textContent = s.localized ? 'Known'
+    : (s.mode === 'navigate' ? 'Not set. Use Set position.' : 'Unknown');
+  $('goal').textContent = goalText(s.nav);
+
+  $('save').disabled = !s.slam_running;
+  $('atstart').disabled = s.mode !== 'navigate';
+  $('cancel').disabled = !['sending', 'driving'].includes(s.nav.state);
+  $('stopall').disabled = s.mode === 'idle' && !s.busy;
+
+  const estop = $('estop');
+  estop.setAttribute('aria-pressed', String(s.estop));
+  estop.textContent = s.estop ? 'Release stop' : 'Stop robot';
+
+  $('log').replaceChildren(...(s.events || []).map((ev) => {
+    const li = document.createElement('li');
+    li.className = ev.level;
+    const t = document.createElement('time');
+    t.textContent = ev.t;
+    li.append(t, ev.text);
+    return li;
+  }));
+}
+
+setTool('goal');
+</script>
+</body>
+</html>

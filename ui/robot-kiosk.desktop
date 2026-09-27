@@ -1,0 +1,20 @@
+# =============================================================================
+# File:        ui/robot-kiosk.desktop
+# Package:     articubot_one
+# =============================================================================
+# DESCRIPTION
+# -----------
+# Desktop autostart entry: opens the control page full-screen on the robot's
+# touchscreen after login. The short delay gives robot-ui time to start.
+#
+# Install:
+#   mkdir -p ~/.config/autostart
+#   cp ~/robot_ws/src/articubot_one/ui/robot-kiosk.desktop ~/.config/autostart/
+#
+# To leave kiosk mode, plug in a keyboard and press Alt+F4.
+# =============================================================================
+[Desktop Entry]
+Type=Application
+Name=Robot control kiosk
+Exec=sh -c "sleep 10; firefox --kiosk http://localhost:8080"
+X-GNOME-Autostart-enabled=true

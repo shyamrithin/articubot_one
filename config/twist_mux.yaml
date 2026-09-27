@@ -1,3 +1,25 @@
+# =============================================================================
+# File:        config/twist_mux.yaml
+# Package:     articubot_one
+# =============================================================================
+# DESCRIPTION
+# -----------
+# Velocity command arbitration. twist_mux forwards the highest-priority
+# source that has published within its timeout, so a source that goes quiet
+# (page closed, wifi dropped, joystick deadman released) hands control back
+# down the ladder, and if nothing publishes the robot stops.
+#
+#   255  estop       cmd_vel_estop     Stop robot button (robot UI)   NEW
+#   100  joystick    cmd_vel_joy       gamepad with LB held
+#    80  web         cmd_vel_web       Drive pad on the robot UI      NEW
+#    20  tracker     cmd_vel_tracker   ball tracker
+#    10  navigation  cmd_vel           Nav2
+#
+# The web pad sits below the gamepad on purpose: someone standing next to
+# the robot with the pad can always override a remote phone.
+# Existing entries are unchanged.
+# =============================================================================
+
 twist_mux:
   ros__parameters:
     topics:
@@ -9,7 +31,15 @@ twist_mux:
         topic   : cmd_vel_tracker
         timeout : 0.5
         priority: 20
+      web:
+        topic   : cmd_vel_web
+        timeout : 0.5
+        priority: 80
       joystick:
         topic   : cmd_vel_joy
         timeout : 0.5
         priority: 100
+      estop:
+        topic   : cmd_vel_estop
+        timeout : 0.5
+        priority: 255
