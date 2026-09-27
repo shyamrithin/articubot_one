@@ -325,7 +325,12 @@ class RobotSupervisor(Node):
         self.events.appendleft({'t': datetime.now().strftime('%H:%M:%S'),
                                 'level': level, 'text': text})
         logger = self.get_logger()
-        {'info': logger.info, 'warn': logger.warning, 'error': logger.error}[level](text)
+        if level == 'error':
+            logger.error(text)
+        elif level == 'warn':
+            logger.warning(text)
+        else:
+            logger.info(text)
 
     # -- commands ----------------------------------------------------------
 
