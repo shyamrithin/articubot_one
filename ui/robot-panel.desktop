@@ -1,0 +1,21 @@
+# =============================================================================
+# File:        ui/robot-panel.desktop
+# Package:     articubot_one
+# =============================================================================
+# DESCRIPTION
+# -----------
+# Desktop autostart entry: opens the touchscreen panel full-screen after the
+# robot logs in to its desktop. Only install this once the panel works when
+# started by hand.
+#
+# Install:
+#   mkdir -p ~/.config/autostart
+#   cp ~/robot_ws/src/articubot_one/ui/robot-panel.desktop ~/.config/autostart/
+# Remove:
+#   rm ~/.config/autostart/robot-panel.desktop
+# =============================================================================
+[Desktop Entry]
+Type=Application
+Name=Robot panel
+Exec=/home/shyam/robot_ws/src/articubot_one/ui/start_panel.sh
+X-GNOME-Autostart-enabled=true
