@@ -1,0 +1,67 @@
+<?xml version="1.0"?>
+<!--
+=============================================================================
+File:        description/thermal.xacro
+Package:     articubot_one
+=============================================================================
+DESCRIPTION
+Frames for the MLX90640 thermal camera (110 x 75 degree lens), mounted
+centred on the front of the robot.
+
+  thermal_link          camera body: x forward, y left, z up
+  thermal_link_optical  same point, camera convention: z forward, x right,
+                        y down. The thermal node stamps its images and
+                        hotspot directions in this frame.
+
+MEASURED ON THE ROBOT (Oct 2026, +/- 5 mm, tilt approximate)
+
+  lens height above floor   95 mm
+  ahead of drive axle       80 mm
+  sideways offset            0 mm (centred)
+  tilt                      about 2.5 degrees UP
+
+base_link sits on the drive-wheel axle at axle height (this URDF puts
+base_footprint at the same point, not on the floor), so the lens is
+95 - 32.5 (wheel radius) = 62.5 mm above base_link.
+
+ROS pitch is positive nose-DOWN, so 2.5 degrees up is pitch = -0.044 rad.
+
+The frame is attached to base_link directly rather than to chassis, so it
+depends only on the measurements above and not on the chassis offsets.
+If the tilt is later measured properly (hot mug at a known distance on the
+floor), update the pitch here.
+=============================================================================
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+    <xacro:property name="thermal_x" value="0.080"/>
+    <xacro:property name="thermal_z" value="0.0625"/>
+    <xacro:property name="thermal_pitch" value="-0.044"/>
+
+    <joint name="thermal_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="thermal_link"/>
+        <origin xyz="${thermal_x} 0 ${thermal_z}" rpy="0 ${thermal_pitch} 0"/>
+    </joint>
+
+    <link name="thermal_link">
+        <visual>
+            <origin xyz="-0.006 0 0" rpy="0 0 0"/>
+            <geometry>
+                <box size="0.012 0.026 0.026"/>
+            </geometry>
+            <material name="thermal_orange">
+                <color rgba="0.95 0.42 0.11 1.0"/>
+            </material>
+        </visual>
+    </link>
+
+    <joint name="thermal_optical_joint" type="fixed">
+        <parent link="thermal_link"/>
+        <child link="thermal_link_optical"/>
+        <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
+    </joint>
+
+    <link name="thermal_link_optical"/>
+
+</robot>
