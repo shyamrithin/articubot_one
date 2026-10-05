@@ -29,15 +29,26 @@
 #
 # PROCESSING, PER FRAME
 # ---------------------
+#   0. The sensor is read in a separate process. Reading it is heavy pure
+#      Python, and sharing one process with the colour drawing halved the
+#      frame rate and caused bad reads whenever RViz was watching.
 #   1. Dead pixels: anything outside the sensor's -40..300 C range is
 #      replaced with the mean of its valid neighbours.
 #   2. Orientation: flip_v / flip_h so the image reads like a normal camera
 #      (on this robot: flip_v = true, flip_h = false).
 #   3. Light temporal smoothing (exponential average) to stop flicker.
-#   4. Hotspots: pixels above hot_threshold_c AND at least min_contrast_c
-#      above the scene's median, grouped into 4-connected blobs. Rows listed
-#      in mask_bottom_rows are ignored, for when the frame's bottom edge
-#      sees the robot itself.
+#   4. Hotspots, with hysteresis: a blob must contain at least one pixel
+#      above hot_threshold_c AND min_contrast_c over the scene's median, but
+#      grows into touching pixels (diagonals included) that are up to
+#      grow_margin_c below those limits. So a palm joins the fingers into
+#      one blob instead of one blob per finger. Rows in mask_bottom_rows are
+#      ignored, for when the frame's bottom edge sees the robot itself.
+#   4b. Confirmation over time: a blob is only published once it has been
+#      seen within match_angle_deg of the same direction in confirm_frames
+#      of the last confirm_window frames (about half a second), and it is
+#      dropped after drop_after_frames frames without a sighting. Sensor
+#      noise near the threshold flickers for a frame or two and never
+#      confirms; a real person stays put long enough to.
 #   5. Direction: pixel position -> angles with a linear angle-per-pixel
 #      model (hfov / 32, vfov / 24), which suits this wide lens better than
 #      a pinhole model, then -> unit vector in the optical frame.
@@ -51,11 +62,19 @@
 #   smoothing (0.5)                     0 = none, closer to 1 = smoother
 #   hot_threshold_c (28.0)              absolute temperature for a hotspot
 #   min_contrast_c (4.0)                required rise above scene median
-#   min_blob_pixels (1)                 smallest blob reported
+#   min_blob_pixels (2)                 smallest blob reported
+#   grow_margin_c (1.0)                 hysteresis: how far below the
+#                                       limits a blob may grow
+#   confirm_frames (4) confirm_window (5)  seen in 4 of the last 5 frames
+#   drop_after_frames (4)               forget after 4 frames unseen
+#   match_angle_deg (8.0)               same target if this close
 #   mask_bottom_rows (0)                ignore this many rows at the bottom
-#   color_scale (10)                    image_color upscale factor
+#   color_scale (8)                     image_color upscale factor
+#   color_every (2)                     draw image_color every Nth frame
 #   color_min_c (20.0) color_max_c (40.0)  fixed palette range
-#   color_auto (false)                  true: per-frame range instead
+#   color_auto (false)                  true: per-frame range instead,
+#   color_min_span_c (6.0)                but never narrower than this, so
+#                                       a uniform scene stays uniform
 #   ray_length_m (3.0)                  length of the RViz direction lines
 #
 # RUN
@@ -70,8 +89,9 @@
 # =============================================================================
 
 import math
+import multiprocessing as mp
+import queue
 import sys
-import threading
 import time
 from collections import deque
 
@@ -117,14 +137,25 @@ def patch_bad_pixels(frame):
     return fixed, count
 
 
-def find_blobs(frame, threshold_c, min_contrast_c, min_pixels, mask_bottom_rows=0):
-    """4-connected warm blobs. Returns dicts with centroid, peak and size."""
-    hot = (frame >= threshold_c) & (frame >= np.median(frame) + min_contrast_c)
+def find_blobs(frame, threshold_c, min_contrast_c, min_pixels,
+               mask_bottom_rows=0, grow_margin_c=1.0):
+    """Warm blobs with hysteresis. Returns dicts with centroid, peak and size.
+
+    Seeds must clear both the absolute threshold and the contrast over the
+    scene median; blobs then grow into 8-connected neighbours that clear
+    both limits minus grow_margin_c.
+    """
+    median = float(np.median(frame))
+    seed = (frame >= threshold_c) & (frame >= median + min_contrast_c)
+    grow = ((frame >= threshold_c - grow_margin_c)
+            & (frame >= median + min_contrast_c - grow_margin_c))
     if mask_bottom_rows > 0:
-        hot[ROWS - mask_bottom_rows:, :] = False
-    seen = np.zeros_like(hot)
+        seed[ROWS - mask_bottom_rows:, :] = False
+        grow[ROWS - mask_bottom_rows:, :] = False
+    seen = np.zeros_like(grow)
+    floor = min(threshold_c, median + min_contrast_c) - grow_margin_c
     blobs = []
-    for r0, c0 in zip(*np.nonzero(hot)):
+    for r0, c0 in zip(*np.nonzero(seed)):
         if seen[r0, c0]:
             continue
         stack, cells = [(r0, c0)], []
@@ -132,17 +163,19 @@ def find_blobs(frame, threshold_c, min_contrast_c, min_pixels, mask_bottom_rows=
         while stack:
             r, c = stack.pop()
             cells.append((r, c))
-            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                rr, cc = r + dr, c + dc
-                if 0 <= rr < ROWS and 0 <= cc < COLS and hot[rr, cc] and not seen[rr, cc]:
-                    seen[rr, cc] = True
-                    stack.append((rr, cc))
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    rr, cc = r + dr, c + dc
+                    if (0 <= rr < ROWS and 0 <= cc < COLS and grow[rr, cc]
+                            and not seen[rr, cc]):
+                        seen[rr, cc] = True
+                        stack.append((rr, cc))
         if len(cells) < min_pixels:
             continue
         rs = np.array([p[0] for p in cells], dtype=float)
         cs = np.array([p[1] for p in cells], dtype=float)
         temps = frame[rs.astype(int), cs.astype(int)]
-        weights = temps - threshold_c + 0.1  # hotter pixels pull the centre
+        weights = temps - floor + 0.1  # hotter pixels pull the centre
         blobs.append({
             'row': float((rs * weights).sum() / weights.sum()),
             'col': float((cs * weights).sum() / weights.sum()),
@@ -151,6 +184,52 @@ def find_blobs(frame, threshold_c, min_contrast_c, min_pixels, mask_bottom_rows=
         })
     blobs.sort(key=lambda b: b['peak_c'], reverse=True)
     return blobs
+
+
+class HotspotTracker:
+    """Confirms blobs that persist in roughly the same direction.
+
+    Directions are compared as (azimuth, elevation) in degrees. Matching is
+    greedy, hottest detection first, which is plenty for a handful of blobs.
+    """
+
+    def __init__(self, confirm_frames=4, window=5, drop_after=4, match_deg=8.0):
+        self.confirm_frames = confirm_frames
+        self.window = window
+        self.drop_after = drop_after
+        self.match_deg = match_deg
+        self.tracks = []
+        self._next_id = 0
+
+    def update(self, detections):
+        """detections: list of (azimuth_deg, elevation_deg, blob). Returns confirmed."""
+        unmatched = list(self.tracks)
+        for az, el, blob in detections:
+            best, best_d = None, self.match_deg
+            for track in unmatched:
+                d = math.hypot(track['az'] - az, track['el'] - el)
+                if d <= best_d:
+                    best, best_d = track, d
+            if best is None:
+                self.tracks.append({'id': self._next_id, 'az': az, 'el': el, 'blob': blob,
+                                    'hits': deque([True], maxlen=self.window),
+                                    'missed': 0, 'confirmed': False})
+                self._next_id += 1
+                continue
+            unmatched.remove(best)
+            best['az'] = 0.5 * best['az'] + 0.5 * az
+            best['el'] = 0.5 * best['el'] + 0.5 * el
+            best['blob'] = blob
+            best['hits'].append(True)
+            best['missed'] = 0
+        for track in unmatched:
+            track['hits'].append(False)
+            track['missed'] += 1
+        for track in self.tracks:
+            if sum(track['hits']) >= self.confirm_frames:
+                track['confirmed'] = True
+        self.tracks = [t for t in self.tracks if t['missed'] < self.drop_after]
+        return [t for t in self.tracks if t['confirmed'] and t['missed'] == 0]
 
 
 def pixel_to_direction(row, col, hfov_deg, vfov_deg):
@@ -189,57 +268,82 @@ def colorize(frame, factor, lo, hi):
     return PALETTE[index]
 
 
-# --- Sensor reader ---------------------------------------------------------------
+# --- Sensor reader (separate process) -------------------------------------------
 
-class SensorReader(threading.Thread):
-    """Pulls frames off the MLX90640 continuously; keeps the newest one."""
-
-    def __init__(self, refresh_hz, logger):
-        super().__init__(daemon=True)
-        self._refresh_hz = refresh_hz
-        self._log = logger
-        self._lock = threading.Lock()
-        self._frame = None
-        self._seq = 0
-        self.errors = 0
-        self.stop_requested = False
-
-    def _open(self):
-        import adafruit_mlx90640
-        import board
-        import busio
-        rates = {2: 'REFRESH_2_HZ', 4: 'REFRESH_4_HZ', 8: 'REFRESH_8_HZ',
-                 16: 'REFRESH_16_HZ', 32: 'REFRESH_32_HZ'}
-        mlx = adafruit_mlx90640.MLX90640(busio.I2C(board.SCL, board.SDA))
-        mlx.refresh_rate = getattr(adafruit_mlx90640.RefreshRate,
-                                   rates.get(self._refresh_hz, 'REFRESH_16_HZ'))
-        return mlx
-
-    def run(self):
-        mlx = None
-        buffer = [0.0] * (ROWS * COLS)
-        while not self.stop_requested:
-            if mlx is None:
-                try:
-                    mlx = self._open()
-                    self._log.info('Thermal camera connected.')
-                except Exception as exc:  # noqa: BLE001  (keep retrying)
-                    self._log.error(f'Thermal camera not available ({exc}); retrying in 2 s.')
-                    time.sleep(2.0)
-                    continue
+def _sensor_process(refresh_hz, frames, stop, errors):
+    """Runs in its own process: read frames, keep only the newest in the queue."""
+    import adafruit_mlx90640
+    import board
+    import busio
+    rates = {2: 'REFRESH_2_HZ', 4: 'REFRESH_4_HZ', 8: 'REFRESH_8_HZ',
+             16: 'REFRESH_16_HZ', 32: 'REFRESH_32_HZ'}
+    mlx = None
+    buffer = [0.0] * (ROWS * COLS)
+    while not stop.is_set():
+        if mlx is None:
             try:
-                mlx.getFrame(buffer)
-            except (ValueError, RuntimeError, OSError):
-                self.errors += 1  # occasional bad read; take the next one
+                mlx = adafruit_mlx90640.MLX90640(busio.I2C(board.SCL, board.SDA))
+                mlx.refresh_rate = getattr(adafruit_mlx90640.RefreshRate,
+                                           rates.get(refresh_hz, 'REFRESH_16_HZ'))
+                print('[thermal sensor] camera connected', file=sys.stderr, flush=True)
+            except Exception as exc:  # noqa: BLE001  (keep retrying)
+                print(f'[thermal sensor] camera not available ({exc}); retrying in 2 s',
+                      file=sys.stderr, flush=True)
+                time.sleep(2.0)
                 continue
-            frame = np.array(buffer, dtype=float).reshape(ROWS, COLS)
-            with self._lock:
-                self._frame = frame
-                self._seq += 1
+        try:
+            mlx.getFrame(buffer)
+        except (ValueError, RuntimeError, OSError):
+            with errors.get_lock():
+                errors.value += 1
+            continue
+        item = list(buffer)
+        try:
+            frames.put_nowait(item)
+        except queue.Full:
+            try:
+                frames.get_nowait()  # drop the stale frame
+            except queue.Empty:
+                pass
+            try:
+                frames.put_nowait(item)
+            except queue.Full:
+                pass
 
-    def latest(self):
-        with self._lock:
-            return self._seq, self._frame
+
+class SensorReader:
+    """Owns the sensor process; hands the newest frame to the ROS side."""
+
+    def __init__(self, refresh_hz):
+        ctx = mp.get_context('spawn')  # never fork a process that has ROS running
+        self._frames = ctx.Queue(maxsize=2)
+        self._stop = ctx.Event()
+        self._errors = ctx.Value('i', 0)
+        self._proc = ctx.Process(target=_sensor_process, daemon=True,
+                                 args=(refresh_hz, self._frames, self._stop, self._errors))
+
+    @property
+    def errors(self):
+        return self._errors.value
+
+    def start(self):
+        self._proc.start()
+
+    def newest(self):
+        """Newest frame since the last call, or None."""
+        frame = None
+        while True:
+            try:
+                frame = self._frames.get_nowait()
+            except queue.Empty:
+                break
+        return None if frame is None else np.array(frame, dtype=float).reshape(ROWS, COLS)
+
+    def stop(self):
+        self._stop.set()
+        self._proc.join(timeout=2.0)
+        if self._proc.is_alive():
+            self._proc.terminate()
 
 
 # --- ROS node -------------------------------------------------------------------
@@ -257,9 +361,17 @@ class ThermalNode(Node):
         self.alpha = min(max(p('smoothing', 0.5).value, 0.0), 0.95)
         self.threshold = p('hot_threshold_c', 28.0).value
         self.contrast = p('min_contrast_c', 4.0).value
-        self.min_pixels = p('min_blob_pixels', 1).value
+        self.min_pixels = p('min_blob_pixels', 2).value
+        self.grow_margin = p('grow_margin_c', 1.0).value
+        self.tracker = HotspotTracker(
+            confirm_frames=p('confirm_frames', 4).value,
+            window=p('confirm_window', 5).value,
+            drop_after=p('drop_after_frames', 4).value,
+            match_deg=p('match_angle_deg', 8.0).value)
         self.mask_rows = p('mask_bottom_rows', 0).value
-        self.color_scale = p('color_scale', 10).value
+        self.color_scale = p('color_scale', 8).value
+        self.color_every = max(1, p('color_every', 2).value)
+        self.color_min_span = p('color_min_span_c', 6.0).value
         self.color_min = p('color_min_c', 20.0).value
         self.color_max = p('color_max_c', 40.0).value
         self.color_auto = p('color_auto', False).value
@@ -279,22 +391,24 @@ class ThermalNode(Node):
             PointField(name='pixels', offset=16, datatype=PointField.FLOAT32, count=1),
         ]
         self._smoothed = None
-        self._last_seq = 0
+        self._frame_count = 0
         self._frame_times = deque(maxlen=40)
+        self._hottest = None
         self._last_report = time.time()
 
-        self.reader = SensorReader(refresh, self.get_logger())
+        self.reader = SensorReader(refresh)
         self.reader.start()
         self.create_timer(0.02, self._tick)
+        self.get_logger().info('Reading the camera in a separate process.')
         self.get_logger().info(
             f'Thermal node up: flip_v={self.flip_v} flip_h={self.flip_h}, '
             f'hotspots above {self.threshold:.1f} C and {self.contrast:.1f} C over the scene.')
 
     def _tick(self):
-        seq, raw = self.reader.latest()
-        if raw is None or seq == self._last_seq:
+        raw = self.reader.newest()
+        if raw is None:
             return
-        self._last_seq = seq
+        self._frame_count += 1
         frame, patched = patch_bad_pixels(raw)
         if self.flip_v:
             frame = frame[::-1, :]
@@ -308,20 +422,42 @@ class ThermalNode(Node):
 
         header = Header(frame_id=FRAME_ID, stamp=self.get_clock().now().to_msg())
         self._publish_image(header, frame)
-        if self.pub_color.get_subscription_count() > 0:
+        if (self._frame_count % self.color_every == 0
+                and self.pub_color.get_subscription_count() > 0):
             self._publish_color(header, frame)
-        blobs = find_blobs(frame, self.threshold, self.contrast,
-                           self.min_pixels, self.mask_rows)
-        self._publish_hotspots(header, blobs)
+        raw_blobs = find_blobs(frame, self.threshold, self.contrast,
+                               self.min_pixels, self.mask_rows, self.grow_margin)
+        detections = []
+        for blob in raw_blobs:
+            dx, dy, dz = pixel_to_direction(blob['row'], blob['col'], self.hfov, self.vfov)
+            detections.append((math.degrees(math.atan2(dx, dz)),
+                               math.degrees(math.asin(max(-1.0, min(1.0, dy)))), blob))
+        confirmed = self.tracker.update(detections)
+        blobs = [t['blob'] for t in confirmed]
+        self._publish_hotspots(header, blobs, [t['id'] for t in confirmed])
         self.pub_max.publish(Float32(data=float(frame.max())))
+        if blobs:
+            top = blobs[0]
+            dx, dy, dz = pixel_to_direction(top['row'], top['col'], self.hfov, self.vfov)
+            self._hottest = (top['peak_c'], math.degrees(math.atan2(dx, dz)),
+                             math.degrees(math.asin(max(-1.0, min(1.0, dy)))))
+        else:
+            self._hottest = None
 
         now = time.time()
         self._frame_times.append(now)
         if now - self._last_report > 30.0 and len(self._frame_times) > 1:
             fps = (len(self._frame_times) - 1) / (self._frame_times[-1] - self._frame_times[0])
+            where = ''
+            if self._hottest is not None:
+                temp, az, el = self._hottest
+                where = (f' Hottest spot {temp:.1f} C at {abs(az):.0f} deg '
+                         f'{"left" if az < 0 else "right"}, {abs(el):.0f} deg '
+                         f'{"up" if el < 0 else "down"}.')
             self.get_logger().info(
                 f'{fps:.1f} frames/s, max {frame.max():.1f} C, {len(blobs)} hotspot(s), '
-                f'{patched} dead pixel(s) patched, {self.reader.errors} bad read(s) so far.')
+                f'{patched} dead pixel(s) patched, {self.reader.errors} bad read(s) so far.'
+                + where)
             self._last_report = now
 
     def _publish_image(self, header, frame):
@@ -333,6 +469,9 @@ class ThermalNode(Node):
     def _publish_color(self, header, frame):
         if self.color_auto:
             lo, hi = float(np.percentile(frame, 2)), float(frame.max())
+            if hi - lo < self.color_min_span:  # keep a uniform scene uniform
+                middle = (hi + lo) / 2.0
+                lo, hi = middle - self.color_min_span / 2.0, middle + self.color_min_span / 2.0
         else:
             lo, hi = self.color_min, self.color_max
         rgb = colorize(frame, self.color_scale, lo, hi)
@@ -341,9 +480,9 @@ class ThermalNode(Node):
         msg.data = rgb.tobytes()
         self.pub_color.publish(msg)
 
-    def _publish_hotspots(self, header, blobs):
+    def _publish_hotspots(self, header, blobs, ids):
         points, markers = [], [Marker(header=header, action=Marker.DELETEALL)]
-        for i, blob in enumerate(blobs):
+        for i, (blob, track_id) in enumerate(zip(blobs, ids)):
             dx, dy, dz = pixel_to_direction(blob['row'], blob['col'], self.hfov, self.vfov)
             points.append((dx, dy, dz, blob['peak_c'], float(blob['pixels'])))
 
@@ -356,16 +495,16 @@ class ThermalNode(Node):
                           Point(x=dx * self.ray_length, y=dy * self.ray_length,
                                 z=dz * self.ray_length)]
             label = Marker(header=header, ns='thermal_labels', id=i, type=Marker.TEXT_VIEW_FACING,
-                           action=Marker.ADD, text=f'{blob["peak_c"]:.1f} C')
+                           action=Marker.ADD, text=f'#{track_id}  {blob["peak_c"]:.1f} C')
             label.pose.position = Point(x=dx * 0.6, y=dy * 0.6 - 0.05, z=dz * 0.6)
-            label.scale.z = 0.06
+            label.scale.z = 0.08
             label.color.r = label.color.g = label.color.b = label.color.a = 1.0
             markers += [ray, label]
         self.pub_hot.publish(point_cloud2.create_cloud(header, self._fields, points))
         self.pub_rays.publish(MarkerArray(markers=markers))
 
     def destroy_node(self):
-        self.reader.stop_requested = True
+        self.reader.stop()
         return super().destroy_node()
 
 
