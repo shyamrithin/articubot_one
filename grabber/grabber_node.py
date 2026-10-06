@@ -19,11 +19,16 @@
 #                                       to find open_deg / closed_deg
 #   /grabber/state   std_msgs/Float32   current commanded angle, 2 Hz
 #
-# Moves are stepped (step_deg every step_delay_s) instead of jumping, so the
-# servo never pulls a big current spike through the 5 V supply. After
-# idle_release_s with no new command the pulses stop and the servo goes
-# limp, so it doesn't sit buzzing and heating against a hard stop. Set
-# idle_release_s to 0 to hold position instead (e.g. while carrying).
+# Small moves (up to direct_move_deg, e.g. teleop nudges) are sent straight
+# to the servo, which then moves at its own full speed. Larger moves are
+# ramped at speed_deg_s, one step per 20 ms PWM period, so a full open or
+# close doesn't pull one big current spike from the 5 V supply. The ramp is
+# deliberately much faster than the old 2-degree staircase, which made the
+# servo slow and visibly jerky.
+#
+# After idle_release_s with no new command the pulses stop and the servo
+# goes limp, so it doesn't sit buzzing and heating against a hard stop.
+# Set idle_release_s to 0 to hold position instead (e.g. while carrying).
 #
 # HARDWARE SETUP (once)
 # ---------------------
@@ -44,8 +49,9 @@
 #   pwm_chip (0) pwm_channel (0)
 #   min_pulse_us (500) max_pulse_us (2500) range_deg (180)
 #   open_deg (110.0) closed_deg (30.0)      placeholders: calibrate these
-#   step_deg (2.0) step_delay_s (0.02)      slew rate
-#   idle_release_s (1.0)                    0 = hold position
+#   speed_deg_s (400.0)                     ramp speed for large moves
+#   direct_move_deg (20.0)                  moves this small go straight there
+#   idle_release_s (3.0)                    0 = hold position
 #
 # RUN
 # ---
@@ -137,9 +143,10 @@ class GrabberNode(Node):
         self.range_deg = p('range_deg', 180.0).value
         self.open_deg = p('open_deg', 110.0).value
         self.closed_deg = p('closed_deg', 30.0).value
-        self.step_deg = max(0.1, p('step_deg', 2.0).value)
-        self.step_delay = max(0.0, p('step_delay_s', 0.02).value)
-        self.idle_release = p('idle_release_s', 1.0).value
+        self.speed = max(10.0, p('speed_deg_s', 400.0).value)
+        self.direct_move = max(0.0, p('direct_move_deg', 20.0).value)
+        self.idle_release = p('idle_release_s', 3.0).value
+        self._move_id = 0  # lets a stale release timer know it was overtaken
 
         self.pwm = SysfsPwm(p('pwm_chip', 0).value, p('pwm_channel', 0).value, self.get_logger())
         self._lock = threading.Lock()
@@ -168,17 +175,31 @@ class GrabberNode(Node):
             if self._release_timer is not None:
                 self._release_timer.cancel()
             start = target if self.angle is None else self.angle  # first move: go direct
-            steps = max(1, int(abs(target - start) / self.step_deg + 0.999))
+            delta = target - start
+            if abs(delta) <= self.direct_move:
+                steps = 1  # small move: let the servo go at full speed
+            else:
+                period = PERIOD_NS / 1e9
+                steps = max(1, int(abs(delta) / (self.speed * period) + 0.999))
             for i in range(1, steps + 1):
-                angle = start + (target - start) * i / steps
+                angle = start + delta * i / steps
                 self.pwm.pulse_us(self._pulse_for(angle))
                 self.angle = angle
-                if self.step_delay > 0.0:
-                    time.sleep(self.step_delay)
+                if steps > 1:
+                    time.sleep(PERIOD_NS / 1e9)  # one step per PWM period
+            self._move_id += 1
             if self.idle_release > 0.0:
-                self._release_timer = threading.Timer(self.idle_release, self.pwm.release)
+                self._release_timer = threading.Timer(self.idle_release, self._release,
+                                                      args=(self._move_id,))
                 self._release_timer.daemon = True
                 self._release_timer.start()
+
+    def _release(self, move_id):
+        with self._lock:
+            # A timer that fired while a newer move held the lock must not
+            # make the servo go limp straight after that move.
+            if move_id == self._move_id:
+                self.pwm.release()
 
     # -- interfaces --------------------------------------------------------
 
