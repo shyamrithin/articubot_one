@@ -55,12 +55,29 @@
 #   TF                  map -> thermal_link_optical, map -> laser_frame
 #                       (needs SLAM or AMCL running, i.e. a 'map' frame)
 #
+# CAMERA-FIXED PHANTOMS
+# ---------------------
+# A faulty sensor pixel reads warm in every frame and stays at the same
+# place in the IMAGE however the robot moves, so it would be projected onto
+# a different wall every time the robot turns. Real objects stay put in the
+# ROOM. So when one thermal track keeps the same camera bearing (within
+# fixed_bearing_tol_deg) while the camera turns by fixed_min_turn_deg or
+# more, that bearing is learned as faulty: hotspots there are ignored from
+# then on, victims built from it are removed, and the list is saved to
+# ~/.ros/thermal_faulty_directions.yaml so it is remembered next run.
+# (The thermal node also ignores a band around the image edge, where this
+# sensor's known phantoms are.)
+#
 # OUTPUTS
 # -------
-#   /victims/markers    MarkerArray: sphere per victim (red = person, orange =
+#   /victims/markers    MarkerArray. Bright, larger, "seeing now" = in view
+#                       right now (seen within active_window_s); dimmed,
+#                       "last seen N s ago" = remembered. Per victim:
+#                       sphere (red = person, orange =
 #                       heat source), translucent disc = 2 sigma uncertainty,
 #                       label: number, temperature, confidence, sightings
 #   /victims            PoseArray of located people (not heat sources)
+#   /victims/active     PoseArray of people being seen right now
 #   /victims/save       std_srvs/Trigger: write ~/maps/victims_<time>.yaml
 #   /victims/clear      std_srvs/Trigger: forget everything
 #   Auto-saved every 30 s to ~/.ros/victims_autosave.yaml
@@ -340,6 +357,46 @@ class Victim:
                 'sightings': self.sightings, 'triangulated': self.triangulated}
 
 
+class CameraFixedFilter:
+    """Learns camera-frame bearings that never move with the robot (bad pixels)."""
+
+    def __init__(self, tol_deg=3.0, min_turn_deg=25.0, faulty=None):
+        self.tol = tol_deg
+        self.min_turn = math.radians(min_turn_deg)
+        self.faulty = list(faulty or [])      # [(azimuth_deg, elevation_deg)]
+        self._tracks = {}                     # track -> stats
+
+    def is_faulty(self, az, el):
+        return any(math.hypot(az - fa, el - fe) <= self.tol for fa, fe in self.faulty)
+
+    def observe(self, track, az, el, cam_yaw, now):
+        """Returns the newly learned faulty bearing for this track, or None."""
+        if track is None:
+            return None
+        t = self._tracks.get(track)
+        if t is None or now - t['last'] > 2.0:
+            t = {'az0': az, 'el0': el, 'yaw0': cam_yaw, 'yaw_min': 0.0, 'yaw_max': 0.0,
+                 'drift': 0.0, 'last': now}
+            self._tracks[track] = t
+        t['last'] = now
+        rel = wrap(cam_yaw - t['yaw0'])
+        t['yaw_min'], t['yaw_max'] = min(t['yaw_min'], rel), max(t['yaw_max'], rel)
+        t['drift'] = max(t['drift'], math.hypot(az - t['az0'], el - t['el0']))
+        if t['drift'] > self.tol:
+            return None  # it moves in the image, as real objects do while turning
+        if t['yaw_max'] - t['yaw_min'] < self.min_turn:
+            return None  # the robot hasn't turned enough yet to judge
+        bearing = (round(t['az0'], 1), round(t['el0'], 1))
+        del self._tracks[track]
+        if self.is_faulty(*bearing):
+            return None
+        self.faulty.append(bearing)
+        return bearing
+
+    def prune(self, now):
+        self._tracks = {k: t for k, t in self._tracks.items() if now - t['last'] <= 2.0}
+
+
 # --- ROS node ---------------------------------------------------------------------
 
 class VictimMapper(Node):
@@ -360,6 +417,14 @@ class VictimMapper(Node):
         self.merge_radius = p('merge_radius_m', 0.4).value
         self.heat_source_c = p('heat_source_c', 45.0).value
         self.max_turn = p('max_turn_rate_rad_s', 1.0).value
+        self.active_window = p('active_window_s', 1.5).value
+        self.faulty_file = os.path.expanduser(
+            p('faulty_directions_file', '~/.ros/thermal_faulty_directions.yaml').value)
+        self.fixed_filter = CameraFixedFilter(
+            tol_deg=p('fixed_bearing_tol_deg', 3.0).value,
+            min_turn_deg=p('fixed_min_turn_deg', 25.0).value,
+            faulty=self._load_faulty())
+        self._track_victims = {}   # thermal track -> {victim id: sightings}
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -378,6 +443,7 @@ class VictimMapper(Node):
         self.create_subscription(LaserScan, '/scan', self._on_scan, qos_profile_sensor_data)
         self.pub_markers = self.create_publisher(MarkerArray, '/victims/markers', 10)
         self.pub_poses = self.create_publisher(PoseArray, '/victims', 10)
+        self.pub_active = self.create_publisher(PoseArray, '/victims/active', 10)
         self.create_service(Trigger, '/victims/save', self._srv_save)
         self.create_service(Trigger, '/victims/clear', self._srv_clear)
         self.create_timer(0.5, self._publish)
@@ -444,9 +510,57 @@ class VictimMapper(Node):
                                         float(row[cols['z']])))
             temp = float(row[cols['temperature']])
             track = int(row[cols['track']]) if 'track' in cols else None
-            self._handle_ray(origin, direction, temp, track, scan_xy, now)
+            cx, cy, cz = float(row[cols['x']]), float(row[cols['y']]), float(row[cols['z']])
+            az = math.degrees(math.atan2(cx, cz))                   # + right, camera frame
+            el = math.degrees(math.asin(max(-1.0, min(1.0, cy))))   # + down
+            if self.fixed_filter.is_faulty(az, el):
+                continue
+            learned = self.fixed_filter.observe(track, az, el, cam_yaw, now)
+            if learned is not None:
+                self._forget_track(track, learned)
+                continue
+            victim = self._handle_ray(origin, direction, temp, track, scan_xy, now)
+            if track is not None and victim is not None:
+                counts = self._track_victims.setdefault(track, {})
+                counts[victim.id] = counts.get(victim.id, 0) + 1
 
+        self.fixed_filter.prune(now)
         self._merge_close()
+
+    def _forget_track(self, track, bearing):
+        """A track turned out to be a faulty pixel: drop what it created."""
+        counts = self._track_victims.pop(track, {})
+        removed = [v for v in self.victims
+                   if counts.get(v.id, 0) >= 0.5 * max(1, v.sightings)]
+        self.victims = [v for v in self.victims if v not in removed]
+        az, el = bearing
+        self.get_logger().warning(
+            f'Ignoring a camera-fixed hotspot at {abs(az):.0f} deg '
+            f'{"right" if az >= 0 else "left"}, {abs(el):.0f} deg '
+            f'{"down" if el >= 0 else "up"} (it never moved while the robot turned: a '
+            f'faulty pixel). Removed {len(removed)} victim(s) built from it.')
+        self._save_faulty()
+
+    def _load_faulty(self):
+        try:
+            with open(self.faulty_file) as handle:
+                data = yaml.safe_load(handle) or {}
+            bearings = [tuple(b) for b in data.get('faulty_bearings_deg', [])]
+            if bearings:
+                self.get_logger().info(f'Loaded {len(bearings)} known faulty thermal '
+                                       f'direction(s) from {self.faulty_file}.')
+            return bearings
+        except (OSError, yaml.YAMLError, TypeError, ValueError):
+            return []
+
+    def _save_faulty(self):
+        try:
+            os.makedirs(os.path.dirname(self.faulty_file), exist_ok=True)
+            with open(self.faulty_file, 'w') as handle:
+                yaml.safe_dump({'faulty_bearings_deg': [list(b) for b in self.fixed_filter.faulty]},
+                               handle)
+        except OSError as exc:
+            self.get_logger().warning(f'Could not save faulty directions: {exc}')
 
     # -- core ----------------------------------------------------------------
 
@@ -469,6 +583,7 @@ class VictimMapper(Node):
         points_down = -math.asin(max(-1.0, min(1.0, direction[2]))) >= self.min_depression
         victim.add((origin[0], origin[1], heading), floor, lidar, temp, track, now, points_down)
         victim.recompute(self.tri_spread, self.tri_baseline)
+        return victim
 
     def _associate(self, origin, heading, estimate, track, now):
         # 1. The thermal node is still tracking this same target.
@@ -520,18 +635,27 @@ class VictimMapper(Node):
         markers.markers.append(clear)
         poses = PoseArray()
         poses.header.frame_id, poses.header.stamp = self.map_frame, stamp
+        active_poses = PoseArray()
+        active_poses.header = poses.header
+        now = time.time()
 
         for v in [v for v in self.victims if v.located]:
             kind = v.kind(self.heat_source_c)
             person = kind == 'person'
+            age = now - v.last_seen
+            active = age <= self.active_window
             alpha = {'high': 1.0, 'medium': 0.75, 'low': 0.45}[v.confidence()]
-            r, g, b = (0.86, 0.12, 0.10) if person else (0.98, 0.55, 0.05)
+            if active:
+                r, g, b = (1.0, 0.10, 0.08) if person else (1.0, 0.60, 0.05)
+            else:  # remembered: darker and see-through
+                r, g, b = (0.50, 0.10, 0.08) if person else (0.60, 0.36, 0.05)
+                alpha *= 0.55
 
             sphere = Marker(type=Marker.SPHERE, action=Marker.ADD, ns='victims', id=v.id)
             sphere.header.frame_id, sphere.header.stamp = self.map_frame, stamp
             sphere.pose.position = Point(x=v.x, y=v.y, z=0.12)
             sphere.pose.orientation.w = 1.0
-            sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.22
+            sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.30 if active else 0.20
             sphere.color.r, sphere.color.g, sphere.color.b, sphere.color.a = r, g, b, alpha
 
             disc = Marker(type=Marker.CYLINDER, action=Marker.ADD, ns='uncertainty', id=v.id)
@@ -549,8 +673,9 @@ class VictimMapper(Node):
             label.scale.z = 0.12
             label.color.r = label.color.g = label.color.b = label.color.a = 1.0
             name = f'Person {v.id}' if person else f'Heat source {v.id}'
-            label.text = (f'{name}\n{float(np.median(v.temps)):.1f} C, {v.confidence()}, '
-                          f'seen {v.sightings}')
+            when = 'SEEING NOW' if active else f'last seen {self._ago(age)} ago'
+            label.text = (f'{name} - {when}\n{float(np.median(v.temps)):.1f} C, '
+                          f'{v.confidence()}, seen {v.sightings}')
             markers.markers += [sphere, disc, label]
 
             if person:
@@ -558,8 +683,11 @@ class VictimMapper(Node):
                 pose.position = Point(x=v.x, y=v.y, z=0.0)
                 pose.orientation.w = 1.0
                 poses.poses.append(pose)
+                if active:
+                    active_poses.poses.append(pose)
 
         self.pub_markers.publish(markers)
+        self.pub_active.publish(active_poses)
         self.pub_poses.publish(poses)
 
         if time.time() - self._last_status > 30.0:
@@ -570,6 +698,14 @@ class VictimMapper(Node):
                 f'{sum(1 for v in self.victims if v.located) - len(people)} heat source(s), '
                 f'{sum(1 for v in self.victims if not v.located)} still being located. '
                 f'Frames skipped while turning: {self._skipped_turning}.')
+
+    @staticmethod
+    def _ago(seconds):
+        if seconds < 60:
+            return f'{seconds:.0f} s'
+        if seconds < 3600:
+            return f'{seconds / 60:.0f} min'
+        return f'{seconds / 3600:.1f} h'
 
     def _snapshot(self):
         return {'saved': datetime.now().isoformat(timespec='seconds'),

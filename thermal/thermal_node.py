@@ -43,8 +43,11 @@
 #      above hot_threshold_c AND min_contrast_c over the scene's median, but
 #      grows into touching pixels (diagonals included) that are up to
 #      grow_margin_c below those limits. So a palm joins the fingers into
-#      one blob instead of one blob per finger. Rows in mask_bottom_rows are
-#      ignored, for when the frame's bottom edge sees the robot itself.
+#      one blob instead of one blob per finger. A band edge_margin_px wide
+#      around the whole image is ignored: this sensor's edge pixels read
+#      warm in every frame (phantoms that follow the robot around).
+#      mask_bottom_rows can hide extra rows at the bottom, if the frame's
+#      bottom edge ever sees the robot itself.
 #   4b. Confirmation over time: a blob is only published once it has been
 #      seen within match_angle_deg of the same direction in confirm_frames
 #      of the last confirm_window frames (about half a second), and it is
@@ -71,8 +74,9 @@
 #   confirm_frames (4) confirm_window (5)  seen in 4 of the last 5 frames
 #   drop_after_frames (4)               forget after 4 frames unseen
 #   match_angle_deg (8.0)               same target if this close
-#   mask_bottom_rows (1)                ignore this many rows at the bottom
-#                                       (1 hides this sensor's stuck corner)
+#   edge_margin_px (2)                  ignore this many pixels on every
+#                                       edge (2: usable view ~96 x 62 deg)
+#   mask_bottom_rows (0)                extra rows to ignore at the bottom
 #   color_scale (8)                     image_color upscale factor
 #   color_every (2)                     draw image_color every Nth frame
 #   color_min_c (20.0) color_max_c (40.0)  fixed palette range
@@ -142,7 +146,7 @@ def patch_bad_pixels(frame):
 
 
 def find_blobs(frame, threshold_c, min_contrast_c, min_pixels,
-               mask_bottom_rows=0, grow_margin_c=1.0):
+               mask_bottom_rows=0, grow_margin_c=1.0, edge_margin=0):
     """Warm blobs with hysteresis. Returns dicts with centroid, peak and size.
 
     Seeds must clear both the absolute threshold and the contrast over the
@@ -156,6 +160,11 @@ def find_blobs(frame, threshold_c, min_contrast_c, min_pixels,
     if mask_bottom_rows > 0:
         seed[ROWS - mask_bottom_rows:, :] = False
         grow[ROWS - mask_bottom_rows:, :] = False
+    if edge_margin > 0:
+        inner = np.zeros_like(seed)
+        inner[edge_margin:ROWS - edge_margin, edge_margin:COLS - edge_margin] = True
+        seed &= inner
+        grow &= inner
     seen = np.zeros_like(grow)
     floor = min(threshold_c, median + min_contrast_c) - grow_margin_c
     blobs = []
@@ -372,7 +381,8 @@ class ThermalNode(Node):
             window=p('confirm_window', 5).value,
             drop_after=p('drop_after_frames', 4).value,
             match_deg=p('match_angle_deg', 8.0).value)
-        self.mask_rows = p('mask_bottom_rows', 1).value
+        self.mask_rows = p('mask_bottom_rows', 0).value
+        self.edge_margin = max(0, p('edge_margin_px', 2).value)
         self.color_scale = p('color_scale', 8).value
         self.color_every = max(1, p('color_every', 2).value)
         self.color_min_span = p('color_min_span_c', 6.0).value
@@ -407,6 +417,7 @@ class ThermalNode(Node):
         self.get_logger().info('Reading the camera in a separate process.')
         self.get_logger().info(
             f'Thermal node up: flip_v={self.flip_v} flip_h={self.flip_h}, '
+            f'ignoring a {self.edge_margin}-pixel edge band, '
             f'hotspots above {self.threshold:.1f} C and {self.contrast:.1f} C over the scene.')
 
     def _tick(self):
@@ -431,7 +442,8 @@ class ThermalNode(Node):
                 and self.pub_color.get_subscription_count() > 0):
             self._publish_color(header, frame)
         raw_blobs = find_blobs(frame, self.threshold, self.contrast,
-                               self.min_pixels, self.mask_rows, self.grow_margin)
+                               self.min_pixels, self.mask_rows, self.grow_margin,
+                               self.edge_margin)
         detections = []
         for blob in raw_blobs:
             dx, dy, dz = pixel_to_direction(blob['row'], blob['col'], self.hfov, self.vfov)
