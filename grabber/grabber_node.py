@@ -75,6 +75,7 @@ class SysfsPwm:
         self.base = f'/sys/class/pwm/pwmchip{chip}'
         self.path = f'{self.base}/pwm{channel}'
         self.available = False
+        step = 'export'
         try:
             if not os.path.isdir(self.path):
                 self._write(f'{self.base}/export', channel)
@@ -83,15 +84,26 @@ class SysfsPwm:
                 if os.access(f'{self.path}/period', os.W_OK):
                     break
                 time.sleep(0.05)
-            # Duty must never exceed period, so zero duty before setting period.
+            # A freshly exported channel has period 0, and the Pi's PWM driver
+            # rejects ANY write (even duty 0) while the period is 0, so the
+            # period goes first. Duty must also never exceed the period: if a
+            # previous run left a duty longer than 20 ms, zero it and retry.
+            step = 'period'
+            try:
+                self._write(f'{self.path}/period', PERIOD_NS)
+            except OSError:
+                self._write(f'{self.path}/duty_cycle', 0)
+                self._write(f'{self.path}/period', PERIOD_NS)
+            step = 'duty_cycle'
             self._write(f'{self.path}/duty_cycle', 0)
-            self._write(f'{self.path}/period', PERIOD_NS)
+            step = 'enable'
             self._write(f'{self.path}/enable', 1)
             self.available = True
             logger.info(f'Hardware PWM ready at {self.path} (50 Hz).')
         except OSError as exc:
-            logger.warning(f'Hardware PWM unavailable ({exc}). Running in simulated mode; '
-                           'the servo will not move. See the setup notes in this file.')
+            logger.warning(f'Hardware PWM unavailable: setting {step} failed ({exc}). '
+                           'Running in simulated mode; the servo will not move. '
+                           'See the setup notes in this file.')
 
     @staticmethod
     def _write(path, value):
