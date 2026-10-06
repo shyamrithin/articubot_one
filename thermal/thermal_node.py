@@ -16,6 +16,8 @@
 #                         to send over wifi. This is what other nodes use.
 #   /thermal/image_color  sensor_msgs/Image, rgb8, upscaled with the "iron"
 #                         palette, for looking at in RViz / rqt_image_view.
+#                         Confirmed targets are boxed in white; the ignored
+#                         edge band is darkened.
 #                         Only computed while something is subscribed.
 #   /thermal/hotspots     sensor_msgs/PointCloud2, one point per warm blob:
 #                         x, y, z  = unit direction from the camera to the
@@ -72,7 +74,9 @@
 #   grow_margin_c (1.0)                 hysteresis: how far below the
 #                                       limits a blob may grow
 #   confirm_frames (4) confirm_window (5)  seen in 4 of the last 5 frames
-#   drop_after_frames (4)               forget after 4 frames unseen
+#   drop_after_frames (8)               forget after 8 frames (~1 s) unseen;
+#                                       a target back within that time keeps
+#                                       its track and needn't re-confirm
 #   match_angle_deg (8.0)               same target if this close
 #   edge_margin_px (2)                  ignore this many pixels on every
 #                                       edge (2: usable view ~96 x 62 deg)
@@ -281,6 +285,31 @@ def colorize(frame, factor, lo, hi):
     return PALETTE[index]
 
 
+def draw_overlay(rgb, scale, edge_margin, blobs):
+    """Darken the ignored edge band and box each confirmed target."""
+    out = rgb.copy()
+    h, w = out.shape[:2]
+    if edge_margin > 0:
+        m = edge_margin * scale
+        band = np.ones((h, w), dtype=bool)
+        band[m:h - m, m:w - m] = False
+        out[band] = (out[band] * 0.35).astype(np.uint8)
+    for blob in blobs:
+        cy = int((blob['row'] + 0.5) * scale)
+        cx = int((blob['col'] + 0.5) * scale)
+        half = int(max(1.5, math.sqrt(blob['pixels'])) * scale * 0.7)
+        y0, y1 = max(0, cy - half), min(h - 1, cy + half)
+        x0, x1 = max(0, cx - half), min(w - 1, cx + half)
+        for t in range(2):  # 2-pixel white box
+            out[min(h - 1, y0 + t), x0:x1 + 1] = 255
+            out[max(0, y1 - t), x0:x1 + 1] = 255
+            out[y0:y1 + 1, min(w - 1, x0 + t)] = 255
+            out[y0:y1 + 1, max(0, x1 - t)] = 255
+        out[max(0, cy - 1):cy + 2, max(0, cx - 4):cx + 5] = 255  # centre cross
+        out[max(0, cy - 4):cy + 5, max(0, cx - 1):cx + 2] = 255
+    return out
+
+
 # --- Sensor reader (separate process) -------------------------------------------
 
 def _sensor_process(refresh_hz, frames, stop, errors):
@@ -379,7 +408,7 @@ class ThermalNode(Node):
         self.tracker = HotspotTracker(
             confirm_frames=p('confirm_frames', 4).value,
             window=p('confirm_window', 5).value,
-            drop_after=p('drop_after_frames', 4).value,
+            drop_after=p('drop_after_frames', 8).value,
             match_deg=p('match_angle_deg', 8.0).value)
         self.mask_rows = p('mask_bottom_rows', 0).value
         self.edge_margin = max(0, p('edge_margin_px', 2).value)
@@ -438,9 +467,6 @@ class ThermalNode(Node):
 
         header = Header(frame_id=FRAME_ID, stamp=self.get_clock().now().to_msg())
         self._publish_image(header, frame)
-        if (self._frame_count % self.color_every == 0
-                and self.pub_color.get_subscription_count() > 0):
-            self._publish_color(header, frame)
         raw_blobs = find_blobs(frame, self.threshold, self.contrast,
                                self.min_pixels, self.mask_rows, self.grow_margin,
                                self.edge_margin)
@@ -452,6 +478,9 @@ class ThermalNode(Node):
         confirmed = self.tracker.update(detections)
         blobs = [t['blob'] for t in confirmed]
         self._publish_hotspots(header, blobs, [t['id'] for t in confirmed])
+        if (self._frame_count % self.color_every == 0
+                and self.pub_color.get_subscription_count() > 0):
+            self._publish_color(header, frame, blobs)
         self.pub_max.publish(Float32(data=float(frame.max())))
         if blobs:
             top = blobs[0]
@@ -483,7 +512,7 @@ class ThermalNode(Node):
         msg.data = frame.astype(np.float32).tobytes()
         self.pub_image.publish(msg)
 
-    def _publish_color(self, header, frame):
+    def _publish_color(self, header, frame, blobs=()):
         if self.color_auto:
             lo, hi = float(np.percentile(frame, 2)), float(frame.max())
             if hi - lo < self.color_min_span:  # keep a uniform scene uniform
@@ -492,6 +521,7 @@ class ThermalNode(Node):
         else:
             lo, hi = self.color_min, self.color_max
         rgb = colorize(frame, self.color_scale, lo, hi)
+        rgb = draw_overlay(rgb, self.color_scale, self.edge_margin, blobs)
         msg = Image(header=header, height=rgb.shape[0], width=rgb.shape[1],
                     encoding='rgb8', is_bigendian=0, step=rgb.shape[1] * 3)
         msg.data = rgb.tobytes()

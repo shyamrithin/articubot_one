@@ -55,6 +55,14 @@
 #   TF                  map -> thermal_link_optical, map -> laser_frame
 #                       (needs SLAM or AMCL running, i.e. a 'map' frame)
 #
+# MOVING TARGETS
+# --------------
+# Victims are assumed to stay put, so every reading is averaged into one
+# position. If move_confirm_frames confident readings in a row land more
+# than max(move_min_m, 3 sigma) from that position, the target has moved:
+# its old evidence is discarded and it is re-located from the new readings,
+# keeping the same victim number.
+#
 # CAMERA-FIXED PHANTOMS
 # ---------------------
 # A faulty sensor pixel reads warm in every frame and stays at the same
@@ -255,6 +263,7 @@ class Victim:
         self.sightings = 0
         self.first_seen = self.last_seen = now
         self.triangulated = False
+        self.disagree = 0   # consecutive confident readings far from the estimate
 
     @property
     def located(self):
@@ -338,6 +347,16 @@ class Victim:
         self.y = sum(w * y for w, y in zip(weights, ys)) / total
         self.sigma = max(0.05, 1.0 / math.sqrt(total))
 
+    def relocate(self):
+        """The target has moved: drop the old position evidence, keep identity."""
+        self.direct.clear()
+        self.rays.clear()
+        self.history.clear()
+        self.x = self.y = None
+        self.sigma = math.inf
+        self.triangulated = False
+        self.disagree = 0
+
     def merge(self, other):
         self.direct.extend(other.direct)
         self.history.extend(other.history)
@@ -418,6 +437,9 @@ class VictimMapper(Node):
         self.heat_source_c = p('heat_source_c', 45.0).value
         self.max_turn = p('max_turn_rate_rad_s', 1.0).value
         self.active_window = p('active_window_s', 1.5).value
+        self.move_frames = p('move_confirm_frames', 5).value
+        self.move_min_m = p('move_min_m', 0.5).value
+        self.move_max_sigma = p('move_max_sigma_m', 0.4).value
         self.faulty_file = os.path.expanduser(
             p('faulty_directions_file', '~/.ros/thermal_faulty_directions.yaml').value)
         self.fixed_filter = CameraFixedFilter(
@@ -580,10 +602,23 @@ class VictimMapper(Node):
             victim = Victim(self._next_id, now)
             self._next_id += 1
             self.victims.append(victim)
+        elif victim.located:
+            self._check_moved(victim, estimate)
         points_down = -math.asin(max(-1.0, min(1.0, direction[2]))) >= self.min_depression
         victim.add((origin[0], origin[1], heading), floor, lidar, temp, track, now, points_down)
         victim.recompute(self.tri_spread, self.tri_baseline)
         return victim
+
+    def _check_moved(self, victim, estimate):
+        """Relocate a victim when confident readings keep landing elsewhere."""
+        if estimate is None or estimate[2] > self.move_max_sigma:
+            return  # only confident readings can say the target moved
+        gap = math.hypot(estimate[0] - victim.x, estimate[1] - victim.y)
+        limit = max(self.move_min_m, 3.0 * math.hypot(estimate[2], victim.sigma))
+        victim.disagree = victim.disagree + 1 if gap > limit else 0
+        if victim.disagree >= self.move_frames:
+            victim.relocate()
+            self.get_logger().info(f'Victim {victim.id} has moved; re-locating it.')
 
     def _associate(self, origin, heading, estimate, track, now):
         # 1. The thermal node is still tracking this same target.
