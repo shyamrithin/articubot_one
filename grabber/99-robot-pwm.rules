@@ -1,0 +1,16 @@
+# =============================================================================
+# File:        grabber/99-robot-pwm.rules
+# Package:     articubot_one
+# =============================================================================
+# DESCRIPTION
+# -----------
+# udev rule giving the dialout group (which already owns the robot's serial
+# ports) write access to the hardware PWM, so grabber_node.py runs without
+# sudo. Applies to the chip and to each channel when it is exported.
+#
+# Install:
+#   sudo cp ~/robot_ws/src/articubot_one/grabber/99-robot-pwm.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# Check you are in dialout:  groups   (if not: sudo usermod -aG dialout shyam)
+# =============================================================================
+SUBSYSTEM=="pwm*", PROGRAM="/bin/sh -c 'chown -R root:dialout /sys/class/pwm && chmod -R 770 /sys/class/pwm; chown -R root:dialout /sys/devices/platform/soc/*.pwm/pwm/pwmchip* && chmod -R 770 /sys/devices/platform/soc/*.pwm/pwm/pwmchip*'"

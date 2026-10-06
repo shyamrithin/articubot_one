@@ -23,6 +23,8 @@
 #                                    the camera cannot measure distance)
 #                         temperature = hottest pixel in the blob, deg C
 #                         pixels      = blob size in pixels
+#                         track       = tracking number; stays the same
+#                                       while the same target stays in view
 #   /thermal/rays         visualization_msgs/MarkerArray: those directions
 #                         drawn as lines with a temperature label, for RViz
 #   /thermal/max_c        std_msgs/Float32, hottest valid pixel per frame
@@ -60,19 +62,21 @@
 #   refresh_hz (16)                     sensor rate; two halves per image,
 #                                       so 16 -> ~8 full frames per second
 #   smoothing (0.5)                     0 = none, closer to 1 = smoother
-#   hot_threshold_c (28.0)              absolute temperature for a hotspot
-#   min_contrast_c (4.0)                required rise above scene median
+#   hot_threshold_c (30.0)              absolute temperature for a hotspot
+#   min_contrast_c (2.0)                required rise above scene median
+#                                       (30 / 2 tuned in a ~31 C room)
 #   min_blob_pixels (2)                 smallest blob reported
 #   grow_margin_c (1.0)                 hysteresis: how far below the
 #                                       limits a blob may grow
 #   confirm_frames (4) confirm_window (5)  seen in 4 of the last 5 frames
 #   drop_after_frames (4)               forget after 4 frames unseen
 #   match_angle_deg (8.0)               same target if this close
-#   mask_bottom_rows (0)                ignore this many rows at the bottom
+#   mask_bottom_rows (1)                ignore this many rows at the bottom
+#                                       (1 hides this sensor's stuck corner)
 #   color_scale (8)                     image_color upscale factor
 #   color_every (2)                     draw image_color every Nth frame
 #   color_min_c (20.0) color_max_c (40.0)  fixed palette range
-#   color_auto (false)                  true: per-frame range instead,
+#   color_auto (true)                   true: per-frame range,
 #   color_min_span_c (6.0)                but never narrower than this, so
 #                                       a uniform scene stays uniform
 #   ray_length_m (3.0)                  length of the RViz direction lines
@@ -359,8 +363,8 @@ class ThermalNode(Node):
         self.vfov = p('vfov_deg', 75.0).value
         refresh = p('refresh_hz', 16).value
         self.alpha = min(max(p('smoothing', 0.5).value, 0.0), 0.95)
-        self.threshold = p('hot_threshold_c', 28.0).value
-        self.contrast = p('min_contrast_c', 4.0).value
+        self.threshold = p('hot_threshold_c', 30.0).value
+        self.contrast = p('min_contrast_c', 2.0).value
         self.min_pixels = p('min_blob_pixels', 2).value
         self.grow_margin = p('grow_margin_c', 1.0).value
         self.tracker = HotspotTracker(
@@ -368,13 +372,13 @@ class ThermalNode(Node):
             window=p('confirm_window', 5).value,
             drop_after=p('drop_after_frames', 4).value,
             match_deg=p('match_angle_deg', 8.0).value)
-        self.mask_rows = p('mask_bottom_rows', 0).value
+        self.mask_rows = p('mask_bottom_rows', 1).value
         self.color_scale = p('color_scale', 8).value
         self.color_every = max(1, p('color_every', 2).value)
         self.color_min_span = p('color_min_span_c', 6.0).value
         self.color_min = p('color_min_c', 20.0).value
         self.color_max = p('color_max_c', 40.0).value
-        self.color_auto = p('color_auto', False).value
+        self.color_auto = p('color_auto', True).value
         self.ray_length = p('ray_length_m', 3.0).value
 
         self.pub_image = self.create_publisher(Image, '/thermal/image', qos_profile_sensor_data)
@@ -389,6 +393,7 @@ class ThermalNode(Node):
             PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
             PointField(name='temperature', offset=12, datatype=PointField.FLOAT32, count=1),
             PointField(name='pixels', offset=16, datatype=PointField.FLOAT32, count=1),
+            PointField(name='track', offset=20, datatype=PointField.FLOAT32, count=1),
         ]
         self._smoothed = None
         self._frame_count = 0
@@ -484,7 +489,7 @@ class ThermalNode(Node):
         points, markers = [], [Marker(header=header, action=Marker.DELETEALL)]
         for i, (blob, track_id) in enumerate(zip(blobs, ids)):
             dx, dy, dz = pixel_to_direction(blob['row'], blob['col'], self.hfov, self.vfov)
-            points.append((dx, dy, dz, blob['peak_c'], float(blob['pixels'])))
+            points.append((dx, dy, dz, blob['peak_c'], float(blob['pixels']), float(track_id)))
 
             heat = min(max((blob['peak_c'] - self.threshold) / 10.0, 0.0), 1.0)
             ray = Marker(header=header, ns='thermal_rays', id=i, type=Marker.LINE_LIST,
