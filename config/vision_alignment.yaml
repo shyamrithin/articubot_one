@@ -1,0 +1,9 @@
+align_dist_m: 1.0
+offset_forward_m: 0.02
+offset_right_m: 0.0
+offset_up_m: 0.023
+shift_x_deg: 3.0
+shift_y_deg: -2.5
+web_hfov_deg: 46.0
+web_pitch_deg: 0.0
+web_vfov_deg: 35.0
