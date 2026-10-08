@@ -1,0 +1,90 @@
+# =============================================================================
+# File:        config/sar_params.yaml
+# Package:     articubot_one
+# Platform:    Raspberry Pi 4 (shyam-rpi4) / Ubuntu 22.04 / ROS 2 Humble
+# =============================================================================
+# DESCRIPTION
+# -----------
+# One place for the settings of the search-and-rescue nodes, loaded by
+# launch/perception.launch.py and launch/manipulation.launch.py. Each section
+# is keyed by the node's name.
+#
+#   thermal         thermal/thermal_node.py    MLX90640 hot-spot detection
+#   victim_mapper   thermal/victim_mapper.py   victims on the map
+#   vision          vision/vision_node.py      webcam + thermal overlay
+#   grabber         grabber/grabber_node.py    MG90S servo
+#
+# Values match each node's built-in defaults except where marked CHANGED.
+# Edit here and rebuild (or use --symlink-install and just relaunch).
+# Live changes still work too: ros2 param set /thermal min_contrast_c 1.5
+#
+# TYPES MATTER: a parameter declared as a float must be written with a
+# decimal point (30.0, not 30), or the node refuses to start.
+#
+# NOT HERE ON PURPOSE
+#   Webcam-thermal alignment (shift_x_deg, web_hfov_deg, ...) lives in
+#   ~/.ros/vision_alignment.yaml, written by /vision/save_alignment. Putting
+#   it here as well would override the saved, tuned values.
+# =============================================================================
+
+thermal:
+  ros__parameters:
+    flip_v: true
+    flip_h: false
+    hfov_deg: 110.0
+    vfov_deg: 75.0
+    refresh_hz: 16
+    smoothing: 0.5
+    hot_threshold_c: 30.0
+    min_contrast_c: 1.5          # CHANGED from 2.0: holds targets in a warm room
+    min_blob_pixels: 2
+    grow_margin_c: 1.0
+    confirm_frames: 4
+    confirm_window: 5
+    drop_after_frames: 8
+    match_angle_deg: 8.0
+    mask_bottom_rows: 0
+    edge_margin_px: 2
+    ray_length_m: 3.0
+
+victim_mapper:
+  ros__parameters:
+    map_frame: map
+    floor_z_m: -0.0325
+    floor_max_range_m: 1.5
+    floor_min_depression_deg: 2.5
+    bearing_sigma_deg: 1.5
+    lidar_window_deg: 2.5
+    lidar_surface_offset_m: 0.10
+    tri_min_spread_deg: 8.0
+    tri_min_baseline_m: 0.25
+    assoc_radius_m: 0.6
+    merge_radius_m: 0.4
+    heat_source_c: 45.0
+    max_turn_rate_rad_s: 1.0
+    active_window_s: 1.5
+    move_confirm_frames: 5
+    move_min_m: 0.5
+    move_max_sigma_m: 0.4
+    fixed_bearing_tol_deg: 3.0
+    fixed_min_turn_deg: 25.0
+
+vision:
+  ros__parameters:
+    device: /dev/video0
+    camera_width: 640
+    camera_height: 480
+    camera_fps: 10
+    output_width: 480
+    output_height: 360
+    publish_hz: 5.0
+    jpeg_quality: 70
+    mode: blend
+
+grabber:
+  ros__parameters:
+    open_deg: 0.0                # CHANGED from 110.0: fully retracted
+    closed_deg: 110.0            # CHANGED from 30.0: contact at ~100, firm grip at 110
+    speed_deg_s: 400.0
+    direct_move_deg: 20.0
+    idle_release_s: 3.0
